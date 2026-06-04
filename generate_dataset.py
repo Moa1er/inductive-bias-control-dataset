@@ -1,90 +1,91 @@
 import os
 import shutil
 import torch
-import numpy as np
 import torchvision
-import torchvision.transforms as transforms
+import matplotlib.pyplot as plt
 from torchvision.utils import save_image
-from torch.utils.data import Dataset
 
-# set seed for absolute reproducibility across runs
-np.random.seed(42)
+# for reproducibility
 torch.manual_seed(42)
 
-class PatchPermutedDataset(Dataset):
-    """
-    wraps a dataset and randomizes the grid positions of its patches
-    """
-    def __init__(self, base_dataset, patch_size=8):
-        self.base_dataset = base_dataset
+
+class PatchPermutedCIFAR(torch.utils.data.Dataset):
+    def __init__(self, base_dataset, patch_size=8, seed=42):
+        self.dataset = base_dataset
         self.patch_size = patch_size
+        self.seed = seed
 
     def __len__(self):
-        return len(self.base_dataset)
+        return len(self.dataset)
 
     def __getitem__(self, idx):
-        img, label = self.base_dataset[idx]
-        
-        # convert tensor to numpy for block slicing operations
-        if isinstance(img, torch.Tensor):
-            img_np = img.numpy()
-        else:
-            img_np = np.array(img)
-            
-        c, h, w = img_np.shape
+        img, label = self.dataset[idx]
+        c, h, w = img.shape
         p = self.patch_size
-        
-        num_patches_h = h // p
-        num_patches_w = w // p
-        
-        # break down image into a 5d array: (c, num_h, p, num_w, p)
-        patches = img_np.reshape(c, num_patches_h, p, num_patches_w, p)
-        # reorder axes to isolate patch blocks: (num_h, num_w, c, p, p)
-        patches = patches.transpose(1, 3, 0, 2, 4)
-        # flatten grid into a sequence of items: (num_patches, c, p, p)
-        flattened_patches = patches.reshape(num_patches_h * num_patches_w, c, p, p)
-        
-        # generate a unique permutation for this sample instance
-        perm = np.random.permutation(len(flattened_patches))
-        shuffled_patches = flattened_patches[perm]
-        
-        # reassemble the permuted blocks back into a grid shape
-        shuffled_grid = shuffled_patches.reshape(num_patches_h, num_patches_w, c, p, p)
-        # restore native axis order: (c, num_h, p, num_w, p)
-        reassembled = shuffled_grid.transpose(2, 0, 4, 1, 3)
-        # flatten back to target dimensions: (c, h, w)
-        reassembled = reassembled.reshape(c, h, w)
-        
-        return torch.tensor(reassembled, dtype=torch.float32), label
 
-def generate_static_dataset(output_dir="control_dataset", patch_size=8):
-    # keep raw scale transformation for clean file visualization saving
-    transform = transforms.Compose([transforms.ToTensor()])
-    base_val = torchvision.datasets.CIFAR10(root='./data', train=False, download=True, transform=transform)
-    class_names = base_val.classes
-    
-    # wrap dataset with patch scrambler logic
-    permuted_stream = PatchPermutedDataset(base_val, patch_size=patch_size)
-    
-    if os.path.exists(output_dir):
-        shutil.rmtree(output_dir)
-    os.makedirs(output_dir)
-    
-    for name in class_names:
-        os.makedirs(os.path.join(output_dir, name), exist_ok=True)
-        
-    print(f"generating permuted images into {output_dir}...")
-    
-    for idx in range(len(permuted_stream)):
-        img_tensor, label = permuted_stream[idx]
-        class_name = class_names[label]
-        img_path = os.path.join(output_dir, class_name, f"permuted_{idx}.png")
-        save_image(img_tensor, img_path)
-        
-    # zip the folder for external distribution upload hosting
-    zip_name = f"{output_dir}_patch{patch_size}"
-    shutil.make_archive(zip_name, 'zip', output_dir)
-    print(f"saved complete archive to: {zip_name}.zip")
+        # slice image into grid blocks natively in pytorch
+        patches = img.reshape(c, h // p, p, w // p, p).permute(1, 3, 0, 2, 4)
+        patches = patches.reshape(-1, c, p, p)
+
+        # shuffle patches deterministically based on image index
+        torch.manual_seed(self.seed + idx)
+        perm = torch.randperm(patches.size(0))
+        shuffled = patches[perm]
+
+        # rebuild the image tensor
+        grid = shuffled.reshape(h // p, w // p, c, p, p)
+        out_img = grid.permute(2, 0, 3, 1, 4).reshape(c, h, w)
+
+        return out_img, label
+
+
+def save_comparison(orig, perm):
+    # save a quick before/after check
+    fig, axes = plt.subplots(1, 2, figsize=(7, 3.5))
+
+    axes[0].imshow(orig.permute(1, 2, 0).numpy())
+    axes[0].set_title("original")
+    axes[0].axis("off")
+
+    axes[1].imshow(perm.permute(1, 2, 0).numpy())
+    axes[1].set_title("permuted")
+    axes[1].axis("off")
+
+    plt.tight_layout()
+    plt.savefig("placeholder.png", dpi=150)
+    plt.close()
+
 
 if __name__ == "__main__":
-    generate_static_dataset(patch_size=8)
+    patch_size = 8
+    out_dir = "control_dataset"
+
+    # grab raw cifar10 as tensors
+    transform = torchvision.transforms.ToTensor()
+    base_val = torchvision.datasets.CIFAR10(
+        root="./data", train=False, download=True, transform=transform
+    )
+    permuted_val = PatchPermutedCIFAR(base_val, patch_size)
+
+    # generate the sample visual
+    save_comparison(base_val[0][0], permuted_val[0][0])
+
+    # clear out old directory if it exists
+    if os.path.exists(out_dir):
+        shutil.rmtree(out_dir)
+
+    print(f"generating dataset in {out_dir}")
+
+    # dump images into class folders
+    for idx in range(len(permuted_val)):
+        img, label = permuted_val[idx]
+        class_name = base_val.classes[label]
+
+        folder = os.path.join(out_dir, class_name)
+        os.makedirs(folder, exist_ok=True)
+
+        save_image(img, os.path.join(folder, f"perm_{idx}.png"))
+
+    # zip it up for hosting
+    shutil.make_archive(f"{out_dir}_patch{patch_size}", "zip", out_dir)
+    print("done!")
